@@ -2,10 +2,10 @@ import gradio as gr
 from detection.detector import process_video
 
 
-def run_detection(video_path: str | None, confidence: float):
+def run_detection(video_path: str | None, confidence: float, frame_skip: int):
     if video_path is None:
         return None, "Please upload a video file."
-    annotated_path, summary = process_video(video_path, confidence)
+    annotated_path, summary = process_video(video_path, confidence, int(frame_skip))
     return annotated_path, summary
 
 
@@ -37,6 +37,14 @@ class label and confidence score for every detection.
                 label="Confidence Threshold",
                 info="Detections below this score are ignored.",
             )
+            frame_skip_slider = gr.Slider(
+                minimum=1,
+                maximum=5,
+                value=2,
+                step=1,
+                label="Frame Skip",
+                info="Process every Nth frame. Higher = faster but less precise.",
+            )
             detect_btn = gr.Button("Detect Objects", variant="primary")
 
         with gr.Column(scale=1):
@@ -53,7 +61,7 @@ class label and confidence score for every detection.
 
     detect_btn.click(
         fn=run_detection,
-        inputs=[video_input, confidence_slider],
+        inputs=[video_input, confidence_slider, frame_skip_slider],
         outputs=[video_output, summary_output],
     )
 
@@ -63,9 +71,9 @@ class label and confidence score for every detection.
     # -----------------------------------------------------------------------
     gr.Examples(
         examples=[
-            # ["examples/sample.mp4", 0.4],  # add a sample video to enable
+            # ["examples/sample.mp4", 0.4, 2],  # add a sample video to enable
         ],
-        inputs=[video_input, confidence_slider],
+        inputs=[video_input, confidence_slider, frame_skip_slider],
         outputs=[video_output, summary_output],
         fn=run_detection,
         cache_examples=False,

@@ -16,13 +16,48 @@ def get_model() -> YOLO:
     return _model
 
 
-def process_video(video_path: str, confidence: float) -> tuple[str, str]:
+def _draw_detections(frame, detections, color=(0, 200, 60)):
+    """Draw bounding boxes and labels for a list of cached detections."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55
+    thickness = 1
+    for x1, y1, x2, y2, conf_score, cls_name in detections:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        label = f"{cls_name} {conf_score:.2f}"
+        (text_w, text_h), baseline = cv2.getTextSize(
+            label, font, font_scale, thickness
+        )
+        label_y1 = max(y1 - text_h - baseline - 4, 0)
+        cv2.rectangle(
+            frame,
+            (x1, label_y1),
+            (x1 + text_w, label_y1 + text_h + baseline + 4),
+            color,
+            cv2.FILLED,
+        )
+        cv2.putText(
+            frame,
+            label,
+            (x1, label_y1 + text_h + 1),
+            font,
+            font_scale,
+            (0, 0, 0),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
+def process_video(
+    video_path: str, confidence: float, frame_skip: int = 2
+) -> tuple[str, str]:
     """
-    Run YOLOv8 inference on every frame of the input video.
+    Run YOLOv8 inference on the input video with frame skipping.
 
     Args:
         video_path: Path to the uploaded video file.
         confidence: Minimum confidence threshold for detections.
+        frame_skip: Process every Nth frame (1 = all frames, 2 = every other, etc.).
 
     Returns:
         A tuple of (annotated_video_path, detection_summary_text).
@@ -45,54 +80,29 @@ def process_video(video_path: str, confidence: float) -> tuple[str, str]:
     writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     detection_counts: dict[str, int] = defaultdict(int)
+    last_detections: list[tuple] = []
+    frame_idx = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        results = model(frame, conf=confidence, verbose=False)[0]
+        if frame_idx % frame_skip == 0:
+            results = model(frame, conf=confidence, imgsz=640, verbose=False)[0]
 
-        for box in results.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            conf_score = float(box.conf[0])
-            cls_id = int(box.cls[0])
-            cls_name = model.names[cls_id]
+            last_detections = []
+            for box in results.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                conf_score = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                cls_name = model.names[cls_id]
+                detection_counts[cls_name] += 1
+                last_detections.append((x1, y1, x2, y2, conf_score, cls_name))
 
-            detection_counts[cls_name] += 1
-
-            # Bounding box
-            color = (0, 200, 60)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # Label background + text
-            label = f"{cls_name} {conf_score:.2f}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.55
-            thickness = 1
-            (text_w, text_h), baseline = cv2.getTextSize(
-                label, font, font_scale, thickness
-            )
-            label_y1 = max(y1 - text_h - baseline - 4, 0)
-            cv2.rectangle(
-                frame,
-                (x1, label_y1),
-                (x1 + text_w, label_y1 + text_h + baseline + 4),
-                color,
-                cv2.FILLED,
-            )
-            cv2.putText(
-                frame,
-                label,
-                (x1, label_y1 + text_h + 1),
-                font,
-                font_scale,
-                (0, 0, 0),
-                thickness,
-                cv2.LINE_AA,
-            )
-
+        _draw_detections(frame, last_detections)
         writer.write(frame)
+        frame_idx += 1
 
     cap.release()
     writer.release()
