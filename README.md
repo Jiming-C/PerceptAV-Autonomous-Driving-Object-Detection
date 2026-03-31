@@ -1,6 +1,7 @@
 # 🚘 Autonomous Driving Object Detection
 
 A dashcam perception pipeline combining YOLOv8 object detection and classical computer vision for real-time vehicle, pedestrian, and lane identification. Built as a clean implementation of core AV perception techniques — hood masking, Hough transform lane detection, and inference optimization via frame skipping.
+<img width="1494" height="429" alt="image" src="https://github.com/user-attachments/assets/06980589-f072-47e7-b3c5-d497c5379ae9" />
 
 ---
 
