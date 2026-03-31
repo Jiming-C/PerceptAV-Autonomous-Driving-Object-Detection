@@ -32,7 +32,7 @@ def get_model():
 
 
 def _mask_hood(frame):
-    """Black-out the bottom 12% of the frame (the car hood region)."""
+    """Black-out the bottom 20% of the frame (the car hood region)."""
     h = frame.shape[0]
     hood_top = int(h * 0.80)
     frame[hood_top:, :] = 0
@@ -41,18 +41,30 @@ def _mask_hood(frame):
 
 # ── Lane detection ─────────────────────────────────────────────────────────
 
+# Exponential moving average state for left/right lanes: (slope, intercept) or None
+_lane_state = {"left": None, "right": None}
+_SMOOTH = 0.15  # EMA factor — lower = smoother but slower to react to real changes
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def _reset_lane_state():
+    """Reset lane EMA state between videos so they don't bleed into each other."""
+    _lane_state["left"] = None
+    _lane_state["right"] = None
+
 
 def _detect_lanes(frame):
     """Detect and draw averaged/extrapolated lane lines.
 
-    Steps:
-      1. Convert to grayscale, blur, and run Canny edge detection.
-      2. Mask a trapezoidal Region-of-Interest (the road area).
-      3. Find line segments with Hough transform.
-      4. Separate segments into left vs. right lane by slope.
-      5. Average each group and extrapolate into one solid line per side.
+    Improvements:
+      1. CLAHE preprocessing for better edge detection under varying lighting.
+      2. Segments weighted by length so long markings dominate short noise.
+      3. Both a lower (0.5) and upper (5.0) slope bound to reject noise.
+      4. Temporal EMA smoothing across frames to eliminate flicker.
+      5. Fallback to the last valid state when Hough finds nothing.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = _CLAHE.apply(gray)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 45, 150)
 
@@ -72,53 +84,65 @@ def _detect_lanes(frame):
     )
 
     if lines is not None:
-        # Group segments by slope: negative slope → left lane, positive → right
-        left_slopes, left_intercepts = [], []
-        right_slopes, right_intercepts = [], []
+        left_s, left_i, left_w = [], [], []
+        right_s, right_i, right_w = [], [], []
 
         for line in lines:
             x1, y1, x2, y2 = line[0]
             if x2 == x1:
-                continue  # skip vertical lines (infinite slope)
+                continue
             slope = (y2 - y1) / (x2 - x1)
             intercept = y1 - slope * x1
 
-            # Filter out nearly horizontal lines (|slope| < 0.3)
-            if abs(slope) < 0.5:
+            # Reject nearly horizontal and near-vertical lines
+            if abs(slope) < 0.5 or abs(slope) > 5.0:
                 continue
 
+            length = np.hypot(x2 - x1, y2 - y1)
+
             if slope < 0:
-                left_slopes.append(slope)
-                left_intercepts.append(intercept)
+                left_s.append(slope * length)
+                left_i.append(intercept * length)
+                left_w.append(length)
             else:
-                right_slopes.append(slope)
-                right_intercepts.append(intercept)
+                right_s.append(slope * length)
+                right_i.append(intercept * length)
+                right_w.append(length)
 
-        overlay = np.zeros_like(frame)
+        def _update(key, slopes, intercepts, weights):
+            if not weights:
+                return
+            total = np.sum(weights)
+            avg_s = np.sum(slopes) / total
+            avg_i = np.sum(intercepts) / total
+            if _lane_state[key] is None:
+                _lane_state[key] = (avg_s, avg_i)
+            else:
+                prev_s, prev_i = _lane_state[key]
+                _lane_state[key] = (
+                    _SMOOTH * avg_s + (1 - _SMOOTH) * prev_s,
+                    _SMOOTH * avg_i + (1 - _SMOOTH) * prev_i,
+                )
 
-        # Draw the bottom → middle range for each averaged lane
-        y_bottom = h
-        y_top = int(h * 0.6)
+        _update("left", left_s, left_i, left_w)
+        _update("right", right_s, right_i, right_w)
 
-        # Left lane (average of all left segments)
-        if left_slopes:
-            avg_slope = np.mean(left_slopes)
-            avg_intercept = np.mean(left_intercepts)
-            x_bottom = int((y_bottom - avg_intercept) / avg_slope)
-            x_top = int((y_top - avg_intercept) / avg_slope)
-            cv2.line(overlay, (x_bottom, y_bottom), (x_top, y_top), (255, 0, 0), 4)
+    # Draw from smoothed state (also serves as fallback when lines is None)
+    overlay = np.zeros_like(frame)
+    y_bottom = h
+    y_top = int(h * 0.6)
 
-        # Right lane (average of all right segments)
-        if right_slopes:
-            avg_slope = np.mean(right_slopes)
-            avg_intercept = np.mean(right_intercepts)
-            x_bottom = int((y_bottom - avg_intercept) / avg_slope)
-            x_top = int((y_top - avg_intercept) / avg_slope)
-            cv2.line(overlay, (x_bottom, y_bottom), (x_top, y_top), (255, 0, 0), 4)
+    for key in ("left", "right"):
+        if _lane_state[key] is None:
+            continue
+        s, i = _lane_state[key]
+        if s == 0:
+            continue
+        x_bottom = int((y_bottom - i) / s)
+        x_top = int((y_top - i) / s)
+        cv2.line(overlay, (x_bottom, y_bottom), (x_top, y_top), (255, 0, 0), 4)
 
-        frame = cv2.addWeighted(frame, 0.8, overlay, 1.0, 0.0)
-
-    return frame
+    return cv2.addWeighted(frame, 0.8, overlay, 1.0, 0.0)
 
 
 # ── Drawing helpers ────────────────────────────────────────────────────────
@@ -163,7 +187,7 @@ def _draw_boxes(frame, results, model):
 # ── Public API ─────────────────────────────────────────────────────────────
 
 
-def process_video(video_path, confidence=0.4, frame_skip=2):
+def process_video(video_path, confidence=0.4, frame_skip=2, apply_hood_mask=True):
     """
     Run YOLOv8 detection on a video.
 
@@ -172,11 +196,13 @@ def process_video(video_path, confidence=0.4, frame_skip=2):
         confidence:  Minimum detection confidence (0-1).
         frame_skip:  Run inference every Nth frame (1 = every frame).
                      Skipped frames reuse the previous detection results.
+        apply_hood_mask: Whether to blackout the bottom 20% of the hood region.
 
     Returns:
         output_path — path to the annotated H.264 video.
     """
     model = get_model()
+    _reset_lane_state()
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -201,7 +227,8 @@ def process_video(video_path, confidence=0.4, frame_skip=2):
         if not ok:
             break
 
-        frame = _mask_hood(frame)
+        if apply_hood_mask:
+            frame = _mask_hood(frame)
         frame = _detect_lanes(frame)
 
         # Only run inference every Nth frame for speed
@@ -221,7 +248,7 @@ def process_video(video_path, confidence=0.4, frame_skip=2):
     return _transcode_to_h264(tmp_path)
 
 
-def process_image(image_path, confidence=0.4):
+def process_image(image_path, confidence=0.4, apply_hood_mask=True):
     """
     Run YOLOv8 detection on a single image.
 
@@ -229,12 +256,14 @@ def process_image(image_path, confidence=0.4):
         output_path — path to the annotated image.
     """
     model = get_model()
+    _reset_lane_state()
 
     frame = cv2.imread(image_path)
     if frame is None:
         raise ValueError(f"Cannot open image: {image_path}")
 
-    frame = _mask_hood(frame)
+    if apply_hood_mask:
+        frame = _mask_hood(frame)
     frame = _detect_lanes(frame)
 
     results = model(frame, conf=confidence, imgsz=640, verbose=False)[0]
