@@ -1,85 +1,95 @@
+"""
+app.py — Gradio web interface for the AV Object Detection demo.
+
+Run with:  python app.py
+"""
+
 import gradio as gr
-from detection.detector import process_video
+from detection.detector import process_video, process_image
 
 
-def run_detection(video_path: str | None, confidence: float, frame_skip: int):
+# ── Callback functions ─────────────────────────────────────────────────────
+
+
+def run_video(video_path, confidence, frame_skip):
+    """Process a dashcam video and return the annotated result."""
     if video_path is None:
-        return None, "Please upload a video file."
-    annotated_path, summary = process_video(video_path, confidence, int(frame_skip))
-    return annotated_path, summary
+        return None
+    return process_video(video_path, confidence, int(frame_skip))
 
 
-# ---------------------------------------------------------------------------
-# UI
-# ---------------------------------------------------------------------------
+def run_image(image_path, confidence):
+    """Process a dashcam image and return the annotated result."""
+    if image_path is None:
+        return None
+    return process_image(image_path, confidence)
 
-with gr.Blocks(title="YOLOv8 Video Object Detection") as demo:
+
+# ── UI ─────────────────────────────────────────────────────────────────────
+
+with gr.Blocks(title="AV Object Detection") as demo:
     gr.Markdown(
-        """
-# YOLOv8 Video Object Detection
-Upload a video clip, set a confidence threshold, and click **Detect Objects**.
-Annotated frames are written to an output video — bounding boxes include the
-class label and confidence score for every detection.
-        """
+        "# 🚘 Autonomous Driving Object Detection\n"
+        "Detect vehicles, pedestrians, and lane lines on dashcam footage "
+        "using YOLOv8."
     )
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            video_input = gr.Video(
-                label="Input Video",
-                sources=["upload"],
-            )
-            confidence_slider = gr.Slider(
-                minimum=0.1,
-                maximum=0.9,
-                value=0.4,
-                step=0.05,
-                label="Confidence Threshold",
-                info="Detections below this score are ignored.",
-            )
-            frame_skip_slider = gr.Slider(
-                minimum=1,
-                maximum=5,
-                value=2,
-                step=1,
-                label="Frame Skip",
-                info="Process every Nth frame. Higher = faster but less precise.",
-            )
-            detect_btn = gr.Button("Detect Objects", variant="primary")
+    with gr.Tab("Video"):
+        with gr.Row():
+            with gr.Column():
+                vid_in = gr.Video(label="Input Video", sources=["upload"])
+                vid_conf = gr.Slider(
+                    0.1,
+                    0.9,
+                    value=0.4,
+                    step=0.05,
+                    label="Confidence Threshold",
+                )
+                vid_skip = gr.Slider(
+                    1,
+                    5,
+                    value=2,
+                    step=1,
+                    label="Frame Skip",
+                    info="Process every Nth frame. Higher = faster.",
+                )
+                vid_btn = gr.Button("Detect", variant="primary")
+            with gr.Column():
+                vid_out = gr.Video(label="Annotated Video", interactive=False)
 
-        with gr.Column(scale=1):
-            video_output = gr.Video(
-                label="Annotated Video",
-                interactive=False,
-            )
-            summary_output = gr.Textbox(
-                label="Detection Summary",
-                lines=12,
-                interactive=False,
-                placeholder="Detection counts will appear here after processing.",
-            )
+        vid_btn.click(run_video, [vid_in, vid_conf, vid_skip], [vid_out])
 
-    detect_btn.click(
-        fn=run_detection,
-        inputs=[video_input, confidence_slider, frame_skip_slider],
-        outputs=[video_output, summary_output],
-    )
+        # Pre-processed demo — click to see results instantly
+        gr.Markdown("### 👇 Try the demo — click below for instant results")
+        gr.Examples(
+            examples=[["examples/demo.MP4", 0.3, 1]],
+            inputs=[vid_in, vid_conf, vid_skip],
+            outputs=[vid_out],
+            fn=run_video,
+            cache_examples=True,
+            label="Demo Dashcam Video",
+        )
 
-    # -----------------------------------------------------------------------
-    # Examples — replace the placeholder path with a real sample video to
-    # enable one-click examples on Hugging Face Spaces.
-    # -----------------------------------------------------------------------
-    gr.Examples(
-        examples=[
-            # ["examples/sample.mp4", 0.4, 2],  # add a sample video to enable
-        ],
-        inputs=[video_input, confidence_slider, frame_skip_slider],
-        outputs=[video_output, summary_output],
-        fn=run_detection,
-        cache_examples=False,
-        label="Examples (add sample videos to the examples/ folder to enable)",
-    )
+    with gr.Tab("Image"):
+        with gr.Row():
+            with gr.Column():
+                img_in = gr.Image(
+                    label="Input Image", type="filepath", sources=["upload"]
+                )
+                img_conf = gr.Slider(
+                    0.1,
+                    0.9,
+                    value=0.4,
+                    step=0.05,
+                    label="Confidence Threshold",
+                )
+                img_btn = gr.Button("Detect", variant="primary")
+            with gr.Column():
+                img_out = gr.Image(
+                    label="Annotated Image", type="filepath", interactive=False
+                )
 
+        img_btn.click(run_image, [img_in, img_conf], [img_out])
 
 if __name__ == "__main__":
     demo.launch()

@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Gradio cache
+.gradio/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

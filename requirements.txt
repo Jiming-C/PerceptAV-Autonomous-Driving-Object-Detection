@@ -1,3 +1,5 @@
 gradio>=6.0
 ultralytics>=8.0.0
 opencv-python-headless>=4.8.0
+imageio-ffmpeg>=0.4.9
+lapx>=0.9.0
