@@ -1,3 +1,14 @@
+---
+title: PerceptAV Autonomous Driving Object Detection
+emoji: 🚘
+colorFrom: blue
+colorTo: green
+sdk: gradio
+sdk_version: "6.0.0"
+app_file: app.py
+pinned: false
+---
+
 # 🚘 Autonomous Driving Object Detection
 
 A dashcam perception pipeline combining YOLOv8 object detection and classical computer vision for real-time vehicle, pedestrian, and lane identification. Built as a clean implementation of core AV perception techniques — hood masking, Hough transform lane detection, and inference optimization via frame skipping.
