@@ -43,6 +43,9 @@ def _mask_hood(frame):
 
 # Exponential moving average state for left/right lanes: (slope, intercept) or None
 _lane_state = {"left": None, "right": None}
+# How many consecutive frames each lane has been detected (used to fade stale lines)
+_lane_age = {"left": 0, "right": 0}
+_FADE_FRAMES = 15   # frames until a lost lane fully fades out
 _SMOOTH = 0.15  # EMA factor — lower = smoother but slower to react to real changes
 _CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
@@ -51,6 +54,8 @@ def _reset_lane_state():
     """Reset lane EMA state between videos so they don't bleed into each other."""
     _lane_state["left"] = None
     _lane_state["right"] = None
+    _lane_age["left"] = 0
+    _lane_age["right"] = 0
 
 
 def _detect_lanes(frame):
@@ -109,8 +114,24 @@ def _detect_lanes(frame):
                 right_i.append(intercept * length)
                 right_w.append(length)
 
+        def _reject_outliers(slopes, intercepts, weights):
+            """Drop segments whose plain slope is more than 1 std dev from the median."""
+            if len(slopes) < 3:
+                return slopes, intercepts, weights  # not enough data to filter
+            plain_slopes = [s / w for s, w in zip(slopes, weights)]
+            median = np.median(plain_slopes)
+            std = np.std(plain_slopes)
+            keep = [abs(ps - median) <= std for ps in plain_slopes]
+            return (
+                [v for v, k in zip(slopes, keep) if k],
+                [v for v, k in zip(intercepts, keep) if k],
+                [v for v, k in zip(weights, keep) if k],
+            )
+
         def _update(key, slopes, intercepts, weights):
+            slopes, intercepts, weights = _reject_outliers(slopes, intercepts, weights)
             if not weights:
+                _lane_age[key] = max(0, _lane_age[key] - 1)
                 return
             total = np.sum(weights)
             avg_s = np.sum(slopes) / total
@@ -123,17 +144,23 @@ def _detect_lanes(frame):
                     _SMOOTH * avg_s + (1 - _SMOOTH) * prev_s,
                     _SMOOTH * avg_i + (1 - _SMOOTH) * prev_i,
                 )
+            _lane_age[key] = min(_FADE_FRAMES, _lane_age[key] + 1)
 
         _update("left", left_s, left_i, left_w)
         _update("right", right_s, right_i, right_w)
+    else:
+        # No lines found at all — age both lanes down
+        for key in ("left", "right"):
+            _lane_age[key] = max(0, _lane_age[key] - 1)
 
-    # Draw from smoothed state (also serves as fallback when lines is None)
+    # Draw from smoothed state (also serves as fallback when lines is None).
+    # Alpha fades from 1.0 (confident) to 0.0 (stale) based on age.
     overlay = np.zeros_like(frame)
     y_bottom = h
     y_top = int(h * 0.6)
 
     for key in ("left", "right"):
-        if _lane_state[key] is None:
+        if _lane_state[key] is None or _lane_age[key] == 0:
             continue
         s, i = _lane_state[key]
         if s == 0:
@@ -142,7 +169,8 @@ def _detect_lanes(frame):
         x_top = int((y_top - i) / s)
         cv2.line(overlay, (x_bottom, y_bottom), (x_top, y_top), (255, 0, 0), 4)
 
-    return cv2.addWeighted(frame, 0.8, overlay, 1.0, 0.0)
+    lane_alpha = max(_lane_age["left"], _lane_age["right"]) / _FADE_FRAMES
+    return cv2.addWeighted(frame, 0.8, overlay, lane_alpha, 0.0)
 
 
 # ── Drawing helpers ────────────────────────────────────────────────────────
