@@ -18,7 +18,6 @@ A dashcam perception pipeline combining YOLOv8 object detection and classical co
 
 ## Demo
 
-![alt text](tmp48pugu2z-ezgif.com-optimize.gif)
 ![alt text](tmplvkxmjyu-ezgif.com-optimize.gif)
 
 my own 720p dashcam footage on CPU with frame skip=2
