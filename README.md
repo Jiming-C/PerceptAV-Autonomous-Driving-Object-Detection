@@ -1,15 +1,13 @@
 # 🚘 Autonomous Driving Object Detection
 
-A real-time dashcam perception system built with **YOLOv8** and **OpenCV**, featuring object detection and lane line identification. Designed as a clean, beginner-friendly showcase of core autonomous vehicle perception techniques.
-
-> Built to demonstrate skills relevant to roles in autonomous systems at companies like Tesla, Waymo, and Nuro.
+A dashcam perception pipeline combining YOLOv8 object detection and classical computer vision for real-time vehicle, pedestrian, and lane identification. Built as a clean implementation of core AV perception techniques — hood masking, Hough transform lane detection, and inference optimization via frame skipping.
 
 ---
 
 ## Demo
 
 ![alt text](tmp48pugu2z-ezgif.com-optimize.gif)
-
+720p dashcam footage at ~18 FPS on CPU with frame skip=2
 ---
 
 ## Features
@@ -121,8 +119,4 @@ All tuneable parameters live in `detection/detector.py`:
 | `confidence` | UI slider | `0.3` | YOLOv8 detection confidence |
 | `frame_skip` | UI slider | `1` | Run inference every Nth frame |
 
----
 
-## License
-
-MIT
