@@ -9,9 +9,12 @@ A dashcam perception pipeline combining YOLOv8 object detection and classical co
 
 ## Demo
 
-![alt text](tmplvkxmjyu-ezgif.com-optimize.gif)
+### Object Detection + Lane Identification
+<img src="tmp48pugu2z-ezgif.com-optimize.gif" alt="Object detection and lane identification demo" width="100%" />
 
-my own 720p dashcam footage on CPU with frame skip=2
+### Real-World Dashcam Footage (720p, CPU, frame skip=2)
+<img src="tmplvkxmjyu-ezgif.com-optimize.gif" alt="Real dashcam footage detection demo" width="100%" />
+
 ---
 
 ## Features
@@ -92,8 +95,8 @@ object-detection/
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/YOUR_USERNAME/object-detection.git
-cd object-detection
+git clone https://github.com/Jiming-C/PerceptAV-Autonomous-Driving-Object-Detection.git
+cd PerceptAV-Autonomous-Driving-Object-Detection
 
 # 2. Create a virtual environment
 python3 -m venv .venv
