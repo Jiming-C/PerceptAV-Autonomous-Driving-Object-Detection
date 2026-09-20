@@ -1,0 +1,12 @@
+# Minimal dependency set for the test suite and the lane benchmark.
+#
+# Deliberately excludes torch, ultralytics and gradio. The lane pipeline, the
+# trackers and the benchmark are pure NumPy + OpenCV, so this lets CI check all
+# of them in seconds rather than spending minutes installing a deep-learning
+# stack. The handful of tests that genuinely need YOLO weights skip themselves
+# unless PERCEPTAV_TEST_MODEL points at a .pt file; the end-to-end CI job
+# installs the full requirements.txt and sets it.
+numpy>=1.24
+opencv-python-headless>=4.8.0
+pytest>=7.0
+ruff>=0.5

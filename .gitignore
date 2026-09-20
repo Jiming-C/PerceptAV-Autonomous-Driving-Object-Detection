@@ -12,3 +12,10 @@ __pycache__/
 # IDE
 .idea/
 .vscode/
+
+# Datasets (TuSimple etc. — see the README's benchmark section)
+data/
+
+# Benchmark and scratch output
+outputs/
+.pytest_cache/
