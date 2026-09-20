@@ -1,209 +1,231 @@
 """
-detector.py — YOLOv8 object detection for dashcam videos and images.
+detector.py — the end-to-end dashcam perception pipeline.
 
-Provides two public functions:
-  - process_video(video_path, confidence) -> (output_path, summary)
-  - process_image(image_path, confidence) -> (output_path, summary)
+    frame ──▶ hood mask ──┬──▶ YOLOv8 (+ ByteTrack)  ──▶ boxes ─┐
+                          │                                     ├──▶ annotated
+                          └──▶ classical lane pipeline ──▶ lanes┘      frame
+
+The ordering above is the important part, and it is not what this module used
+to do. Lane lines were previously drawn onto the frame *before* YOLO ran, and
+the compositing step dimmed every pixel by 20% on the way past, so the detector
+was being handed a darkened image with blue lines painted across the road and
+asked to find cars in it. Detection and lane-finding both read the same clean
+frame now, and the overlays go on afterwards, where they belong.
+
+Public API:
+    process_video(path, ...) -> (output_path, RunSummary)
+    process_image(path, ...) -> (output_path, RunSummary)
 """
 
-import cv2
-import tempfile
+from __future__ import annotations
+
 import os
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+import cv2
 import numpy as np
-from ultralytics import YOLO
+
+from .config import (
+    CLASS_COLORS,
+    VEHICLE_COLOR,
+    DetectorConfig,
+    LaneConfig,
+    PipelineConfig,
+)
+from .lanes import (
+    EgoLaneTracker,
+    MultiLaneTracker,
+    detect_ego_lanes,
+    detect_multilanes,
+    draw_lanes,
+    mask_hood,
+)
+from .tracking import BoxPredictor, Detection
+
+ProgressFn = Optional[Callable[[float, str], None]]
 
 # ── Model ──────────────────────────────────────────────────────────────────
 
-MODEL_NAME = "yolov8n.pt"
-_model = None
+_models: dict[str, "object"] = {}
 
 
-def get_model():
-    """Load the YOLOv8 model once and cache it globally."""
-    global _model
-    if _model is None:
-        _model = YOLO(MODEL_NAME)
-    return _model
+def get_model(name: str = "yolov8n.pt"):
+    """Load a YOLO model once per name and cache it for the process."""
+    if name not in _models:
+        from ultralytics import YOLO  # imported lazily: it pulls in torch
+
+        _models[name] = YOLO(name)
+    return _models[name]
 
 
-# ── Hood mask ──────────────────────────────────────────────────────────────
-# Many dashcam videos show the car's own hood at the bottom of the frame.
-# We mask that region so YOLO doesn't waste detections on it.
+def _reset_tracker(model) -> None:
+    """Clear ByteTrack's state so one video's ids never leak into the next.
 
-
-def _mask_hood(frame):
-    """Black-out the bottom 20% of the frame (the car hood region)."""
-    h = frame.shape[0]
-    hood_top = int(h * 0.80)
-    frame[hood_top:, :] = 0
-    return frame
-
-
-# ── Lane detection ─────────────────────────────────────────────────────────
-
-# Exponential moving average state for left/right lanes: (slope, intercept) or None
-_lane_state = {"left": None, "right": None}
-# How many consecutive frames each lane has been detected (used to fade stale lines)
-_lane_age = {"left": 0, "right": 0}
-_FADE_FRAMES = 15   # frames until a lost lane fully fades out
-_SMOOTH = 0.15  # EMA factor — lower = smoother but slower to react to real changes
-_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-
-
-def _reset_lane_state():
-    """Reset lane EMA state between videos so they don't bleed into each other."""
-    _lane_state["left"] = None
-    _lane_state["right"] = None
-    _lane_age["left"] = 0
-    _lane_age["right"] = 0
-
-
-def _detect_lanes(frame):
-    """Detect and draw averaged/extrapolated lane lines.
-
-    Improvements:
-      1. CLAHE preprocessing for better edge detection under varying lighting.
-      2. Segments weighted by length so long markings dominate short noise.
-      3. Both a lower (0.5) and upper (5.0) slope bound to reject noise.
-      4. Temporal EMA smoothing across frames to eliminate flicker.
-      5. Fallback to the last valid state when Hough finds nothing.
+    Ultralytics hangs tracker state off the predictor, which is cached on the
+    model alongside the weights. Without this, the second video processed in a
+    session starts counting objects from wherever the first one left off — and
+    worse, can match a new object to a track from the previous clip.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = _CLAHE.apply(gray)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 45, 150)
+    predictor = getattr(model, "predictor", None)
+    for tracker in getattr(predictor, "trackers", []) or []:
+        reset = getattr(tracker, "reset", None)
+        if callable(reset):
+            reset()
 
-    h, w = edges.shape
 
-    # Only look at the road region (a trapezoid in the lower half)
-    roi = np.array(
-        [[(0, h), (w, h), (int(w * 0.6), int(h * 0.6)), (int(w * 0.4), int(h * 0.6))]],
-        dtype=np.int32,
-    )
-    mask = np.zeros_like(edges)
-    cv2.fillPoly(mask, roi, 255)
-    edges = cv2.bitwise_and(edges, mask)
+# ── Summary ────────────────────────────────────────────────────────────────
 
-    lines = cv2.HoughLinesP(
-        edges, 1, np.pi / 180, threshold=40, minLineLength=40, maxLineGap=100
-    )
 
-    if lines is not None:
-        left_s, left_i, left_w = [], [], []
-        right_s, right_i, right_w = [], [], []
+@dataclass
+class RunSummary:
+    """What actually happened during a run.
 
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            if x2 == x1:
-                continue
-            slope = (y2 - y1) / (x2 - x1)
-            intercept = y1 - slope * x1
+    The module docstring has promised callers a summary alongside the output
+    path since the first commit; until now it returned only the path.
+    """
 
-            # Reject nearly horizontal and near-vertical lines
-            if abs(slope) < 0.5 or abs(slope) > 5.0:
-                continue
+    frames: int = 0
+    inference_frames: int = 0
+    seconds: float = 0.0
+    objects: dict[str, int] = field(default_factory=dict)
+    tracked: bool = False
+    lane_frames: int = 0
+    resolution: tuple[int, int] = (0, 0)
 
-            length = np.hypot(x2 - x1, y2 - y1)
+    @property
+    def fps(self) -> float:
+        return self.frames / self.seconds if self.seconds > 0 else 0.0
 
-            if slope < 0:
-                left_s.append(slope * length)
-                left_i.append(intercept * length)
-                left_w.append(length)
-            else:
-                right_s.append(slope * length)
-                right_i.append(intercept * length)
-                right_w.append(length)
+    def to_markdown(self) -> str:
+        width, height = self.resolution
+        counted = "distinct objects tracked" if self.tracked else "peak objects in frame"
+        skipped = self.frames - self.inference_frames
 
-        def _reject_outliers(slopes, intercepts, weights):
-            """Drop segments whose plain slope is more than 1 std dev from the median."""
-            if len(slopes) < 3:
-                return slopes, intercepts, weights  # not enough data to filter
-            plain_slopes = [s / w for s, w in zip(slopes, weights)]
-            median = np.median(plain_slopes)
-            std = np.std(plain_slopes)
-            keep = [abs(ps - median) <= std for ps in plain_slopes]
-            return (
-                [v for v, k in zip(slopes, keep) if k],
-                [v for v, k in zip(intercepts, keep) if k],
-                [v for v, k in zip(weights, keep) if k],
+        if self.frames == 1:
+            lines = [f"**1 frame** at {width}×{height} in {self.seconds:.2f}s"]
+        else:
+            lines = [
+                f"**{self.frames} frames** at {width}×{height} "
+                f"in {self.seconds:.1f}s ({self.fps:.1f} fps)",
+                f"Inference ran on {self.inference_frames} of them"
+                + (
+                    f"; the other {skipped} reused tracked boxes advanced by "
+                    "their measured velocity"
+                    if skipped
+                    else ""
+                ),
+            ]
+        if self.lane_frames:
+            lines.append(
+                "Lane lines drawn on "
+                + ("this frame" if self.frames == 1
+                   else f"{self.lane_frames} frames")
             )
-
-        def _update(key, slopes, intercepts, weights):
-            slopes, intercepts, weights = _reject_outliers(slopes, intercepts, weights)
-            if not weights:
-                _lane_age[key] = max(0, _lane_age[key] - 1)
-                return
-            total = np.sum(weights)
-            avg_s = np.sum(slopes) / total
-            avg_i = np.sum(intercepts) / total
-            if _lane_state[key] is None:
-                _lane_state[key] = (avg_s, avg_i)
-            else:
-                prev_s, prev_i = _lane_state[key]
-                _lane_state[key] = (
-                    _SMOOTH * avg_s + (1 - _SMOOTH) * prev_s,
-                    _SMOOTH * avg_i + (1 - _SMOOTH) * prev_i,
+        if self.objects:
+            rows = "\n".join(
+                f"| {name} | {count} |"
+                for name, count in sorted(
+                    self.objects.items(), key=lambda kv: -kv[1]
                 )
-            _lane_age[key] = min(_FADE_FRAMES, _lane_age[key] + 1)
-
-        _update("left", left_s, left_i, left_w)
-        _update("right", right_s, right_i, right_w)
-    else:
-        # No lines found at all — age both lanes down
-        for key in ("left", "right"):
-            _lane_age[key] = max(0, _lane_age[key] - 1)
-
-    # Draw from smoothed state (also serves as fallback when lines is None).
-    # Alpha fades from 1.0 (confident) to 0.0 (stale) based on age.
-    overlay = np.zeros_like(frame)
-    y_bottom = h
-    y_top = int(h * 0.6)
-
-    for key in ("left", "right"):
-        if _lane_state[key] is None or _lane_age[key] == 0:
-            continue
-        s, i = _lane_state[key]
-        if s == 0:
-            continue
-        x_bottom = int((y_bottom - i) / s)
-        x_top = int((y_top - i) / s)
-        cv2.line(overlay, (x_bottom, y_bottom), (x_top, y_top), (255, 0, 0), 4)
-
-    lane_alpha = max(_lane_age["left"], _lane_age["right"]) / _FADE_FRAMES
-    return cv2.addWeighted(frame, 0.8, overlay, lane_alpha, 0.0)
+            )
+            lines.append(f"\n| class | {counted} |\n|---|---|\n{rows}")
+        else:
+            lines.append("\nNo objects detected above the confidence threshold.")
+        return "\n\n".join(lines)
 
 
-# ── Drawing helpers ────────────────────────────────────────────────────────
+class _ObjectCounter:
+    """Counts distinct tracked objects, or peak simultaneous ones without ids."""
+
+    def __init__(self):
+        self._ids: dict[str, set] = {}
+        self._peak: dict[str, int] = {}
+
+    def add(self, detections: list[Detection]) -> None:
+        per_frame: dict[str, int] = {}
+        for det in detections:
+            if det.coasted:
+                continue  # coasted boxes are re-draws, not new observations
+            per_frame[det.cls_name] = per_frame.get(det.cls_name, 0) + 1
+            if det.track_id is not None:
+                self._ids.setdefault(det.cls_name, set()).add(det.track_id)
+        for name, count in per_frame.items():
+            self._peak[name] = max(self._peak.get(name, 0), count)
+
+    def result(self) -> tuple[dict[str, int], bool]:
+        if self._ids:
+            return {k: len(v) for k, v in self._ids.items()}, True
+        return dict(self._peak), False
 
 
-def _draw_boxes(frame, results, model):
-    """Draw bounding boxes and labels on the frame."""
-    if results.boxes is None:
-        return
+# ── Inference ──────────────────────────────────────────────────────────────
 
-    for box in results.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-        conf = float(box.conf[0])
-        cls_name = model.names[int(box.cls[0])]
 
-        # Green box
-        color = (0, 200, 60)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-        # Label background + text
-        label = f"{cls_name} {conf:.2f}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(
-            frame,
-            (x1, max(y1 - th - 6, 0)),
-            (x1 + tw, max(y1 - th - 6, 0) + th + 6),
-            color,
-            -1,
+def _to_detections(result, model) -> list[Detection]:
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return []
+    detections = []
+    ids = boxes.id.int().tolist() if getattr(boxes, "id", None) is not None else None
+    for i, box in enumerate(boxes):
+        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
+        cls_id = int(box.cls[0])
+        detections.append(
+            Detection(
+                xyxy=(x1, y1, x2, y2),
+                cls_id=cls_id,
+                cls_name=model.names[cls_id],
+                confidence=float(box.conf[0]),
+                track_id=ids[i] if ids else None,
+            )
         )
+    return detections
+
+
+def _infer(model, frame: np.ndarray, cfg: DetectorConfig) -> list[Detection]:
+    kwargs = dict(
+        conf=cfg.confidence,
+        iou=cfg.iou,
+        imgsz=cfg.imgsz,
+        classes=list(cfg.classes) if cfg.classes else None,
+        verbose=False,
+    )
+    if cfg.track:
+        result = model.track(frame, persist=True, tracker=cfg.tracker, **kwargs)[0]
+    else:
+        result = model(frame, **kwargs)[0]
+    return _to_detections(result, model)
+
+
+# ── Drawing ────────────────────────────────────────────────────────────────
+
+
+def _draw_boxes(frame: np.ndarray, detections: list[Detection],
+                show_track_ids: bool = True) -> None:
+    """Draw boxes in place, coloured by what the object means to a driver."""
+    for det in detections:
+        x1, y1, x2, y2 = (int(round(v)) for v in det.xyxy)
+        color = CLASS_COLORS.get(det.cls_id, VEHICLE_COLOR)
+        # A coasted box is a prediction, not an observation. Drawing it thinner
+        # is a small honesty: the viewer can see which frames were inferred.
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1 if det.coasted else 2)
+
+        label = det.cls_name
+        if show_track_ids and det.track_id is not None:
+            label += f" #{det.track_id}"
+        label += f" {det.confidence:.2f}"
+
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        top = max(y1 - th - 6, 0)
+        cv2.rectangle(frame, (x1, top), (x1 + tw + 4, top + th + 6), color, -1)
         cv2.putText(
             frame,
             label,
-            (x1, max(y1 - 4, th + 4)),
+            (x1 + 2, top + th + 1),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             (0, 0, 0),
@@ -212,134 +234,272 @@ def _draw_boxes(frame, results, model):
         )
 
 
+# ── Lane stage ─────────────────────────────────────────────────────────────
+
+
+class _LaneStage:
+    """Runs whichever lane mode was asked for and keeps its temporal state."""
+
+    def __init__(self, mode: str, cfg: LaneConfig, hood_line: Optional[int]):
+        self.mode = mode
+        self.cfg = cfg
+        self.hood_line = hood_line
+        self.tracker = (
+            EgoLaneTracker(cfg)
+            if mode == "ego"
+            else MultiLaneTracker(cfg)
+            if mode == "multi"
+            else None
+        )
+
+    def __call__(self, frame: np.ndarray) -> list:
+        if self.tracker is None:
+            return []
+        height = frame.shape[0]
+        if self.mode == "ego":
+            left, right = detect_ego_lanes(frame, self.cfg, y_bottom=self.hood_line)
+            return self.tracker.update(left, right, height, y_bottom=self.hood_line)
+        fits = detect_multilanes(frame, self.cfg, y_bottom=self.hood_line)
+        return self.tracker.update(fits, height, y_bottom=self.hood_line)
+
+
+def _build_config(
+    confidence: float,
+    frame_skip: int,
+    apply_hood_mask: bool,
+    lane_mode: str,
+    config: Optional[PipelineConfig],
+) -> PipelineConfig:
+    """Fold the loose keyword arguments the UI passes into a PipelineConfig."""
+    base = config or PipelineConfig()
+    import dataclasses
+
+    return dataclasses.replace(
+        base,
+        apply_hood_mask=apply_hood_mask,
+        lane_mode=lane_mode,
+        frame_skip=max(1, int(frame_skip)),
+        detector=dataclasses.replace(base.detector, confidence=float(confidence)),
+    )
+
+
 # ── Public API ─────────────────────────────────────────────────────────────
 
 
-def process_video(video_path, confidence=0.4, frame_skip=2, apply_hood_mask=True):
-    """
-    Run YOLOv8 detection on a video.
+def process_video(
+    video_path: str,
+    confidence: float = 0.4,
+    frame_skip: int = 2,
+    apply_hood_mask: bool = True,
+    lane_mode: str = "ego",
+    config: Optional[PipelineConfig] = None,
+    progress: ProgressFn = None,
+) -> tuple[str, RunSummary]:
+    """Run the perception pipeline over a video.
 
     Args:
-        video_path:  Path to the input video file.
-        confidence:  Minimum detection confidence (0-1).
-        frame_skip:  Run inference every Nth frame (1 = every frame).
-                     Skipped frames reuse the previous detection results.
-        apply_hood_mask: Whether to blackout the bottom 20% of the hood region.
+        video_path: Input video.
+        confidence: Minimum detection confidence, 0-1.
+        frame_skip: Run inference every Nth frame. Skipped frames keep their
+            tracked boxes moving at the velocity measured between the last two
+            inference frames, rather than freezing them where they were.
+        apply_hood_mask: Black out the car's own hood before anything reads
+            the frame.
+        lane_mode: "ego" (the two lines around this car), "multi" (every line
+            found) or "off".
+        config: Full PipelineConfig, if you want control beyond the above.
+        progress: Optional callback, called as progress(fraction, message).
 
     Returns:
-        output_path — path to the annotated H.264 video.
+        (output_path, summary) — an H.264 file playable in a browser, and a
+        RunSummary describing the run.
     """
-    model = get_model()
-    _reset_lane_state()
+    cfg = _build_config(confidence, frame_skip, apply_hood_mask, lane_mode, config)
 
+    # Validate the input before loading the model: a typo in a path should not
+    # cost a weights download and a few seconds of torch startup first.
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {video_path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    try:
+        model = get_model(cfg.detector.model_name)
+        _reset_tracker(model)
 
-    # Write to a temp file first (OpenCV uses mp4v codec)
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp_path = tmp.name
-    tmp.close()
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Video reports an empty frame size: {video_path}")
 
-    writer = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        writer = cv2.VideoWriter(
+            tmp_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+        )
+        if not writer.isOpened():
+            os.unlink(tmp_path)
+            raise RuntimeError(
+                f"Cannot open a video writer for {width}x{height} @ {fps:.1f}fps"
+            )
 
-    last_results = None
-    frame_idx = 0
+        hood_line = int(height * cfg.hood_fraction) if cfg.apply_hood_mask else None
+        lane_stage = _LaneStage(cfg.lane_mode, cfg.lane, hood_line)
+        predictor = BoxPredictor(cfg.detector.max_coast_frames)
+        counter = _ObjectCounter()
+        summary = RunSummary(resolution=(width, height))
+        started = time.perf_counter()
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+        try:
+            frame_idx = 0
+            while True:
+                ok, raw = cap.read()
+                if not ok:
+                    break
 
-        if apply_hood_mask:
-            frame = _mask_hood(frame)
-        frame = _detect_lanes(frame)
+                # One clean frame feeds both stages. Nothing is drawn on it.
+                frame = mask_hood(raw, cfg.hood_fraction) if cfg.apply_hood_mask else raw
 
-        # Only run inference every Nth frame for speed
-        if frame_idx % frame_skip == 0:
-            last_results = model(frame, conf=confidence, imgsz=640, verbose=False)[0]
+                if frame_idx % cfg.frame_skip == 0:
+                    detections = predictor.observe(
+                        _infer(model, frame, cfg.detector), frame_idx
+                    )
+                    summary.inference_frames += 1
+                else:
+                    detections = predictor.predict(frame_idx, frame.shape)
 
-        if last_results is not None:
-            _draw_boxes(frame, last_results, model)
+                counter.add(detections)
+                drawables = lane_stage(frame)
+                summary.lane_frames += bool(drawables)
 
-        writer.write(frame)
-        frame_idx += 1
+                annotated = draw_lanes(frame, drawables)
+                if annotated is frame:
+                    annotated = frame.copy()  # never scribble on the source frame
+                _draw_boxes(annotated, detections)
+                writer.write(annotated)
 
-    cap.release()
-    writer.release()
+                frame_idx += 1
+                if progress and total and frame_idx % 10 == 0:
+                    progress(frame_idx / total, f"frame {frame_idx}/{total}")
+        finally:
+            writer.release()
 
-    # Convert to H.264 so browsers can play it
-    return _transcode_to_h264(tmp_path)
+        summary.frames = frame_idx
+        summary.seconds = time.perf_counter() - started
+        summary.objects, summary.tracked = counter.result()
+    finally:
+        cap.release()
+
+    if summary.frames == 0:
+        os.unlink(tmp_path)
+        raise ValueError(f"No frames could be read from: {video_path}")
+
+    if progress:
+        progress(1.0, "encoding")
+    return _transcode_to_h264(tmp_path), summary
 
 
-def process_image(image_path, confidence=0.4, apply_hood_mask=True):
+def process_image(
+    image_path: str,
+    confidence: float = 0.4,
+    apply_hood_mask: bool = True,
+    lane_mode: str = "ego",
+    config: Optional[PipelineConfig] = None,
+) -> tuple[str, RunSummary]:
+    """Run the perception pipeline over a single image.
+
+    Returns (output_path, summary). Tracking is disabled for a single frame —
+    there is nothing to track across — so the summary counts objects found.
     """
-    Run YOLOv8 detection on a single image.
+    cfg = _build_config(confidence, 1, apply_hood_mask, lane_mode, config)
+    import dataclasses
 
-    Returns:
-        output_path — path to the annotated image.
-    """
-    model = get_model()
-    _reset_lane_state()
+    cfg = dataclasses.replace(cfg, detector=dataclasses.replace(cfg.detector, track=False))
 
-    frame = cv2.imread(image_path)
-    if frame is None:
+    raw = cv2.imread(image_path)
+    if raw is None:
         raise ValueError(f"Cannot open image: {image_path}")
 
-    if apply_hood_mask:
-        frame = _mask_hood(frame)
-    frame = _detect_lanes(frame)
+    model = get_model(cfg.detector.model_name)
 
-    results = model(frame, conf=confidence, imgsz=640, verbose=False)[0]
-    _draw_boxes(frame, results, model)
+    height, width = raw.shape[:2]
+    frame = mask_hood(raw, cfg.hood_fraction) if cfg.apply_hood_mask else raw
+
+    started = time.perf_counter()
+    detections = _infer(model, frame, cfg.detector)
+    hood_line = int(height * cfg.hood_fraction) if cfg.apply_hood_mask else None
+    drawables = _LaneStage(cfg.lane_mode, cfg.lane, hood_line)(frame)
+
+    annotated = draw_lanes(frame, drawables)
+    if annotated is frame:
+        annotated = frame.copy()
+    _draw_boxes(annotated, detections)
+
+    counter = _ObjectCounter()
+    counter.add(detections)
+    objects, tracked = counter.result()
+    summary = RunSummary(
+        frames=1,
+        inference_frames=1,
+        seconds=time.perf_counter() - started,
+        objects=objects,
+        tracked=tracked,
+        lane_frames=int(bool(drawables)),
+        resolution=(width, height),
+    )
 
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     output_path = tmp.name
     tmp.close()
-    cv2.imwrite(output_path, frame)
-
-    return output_path
-
-
-# ── H.264 transcoding ─────────────────────────────────────────────────────
-# OpenCV writes mp4v which most browsers can't play. We convert to H.264.
+    cv2.imwrite(output_path, annotated)
+    return output_path, summary
 
 
-def _transcode_to_h264(input_path):
-    """Transcode a video file to web-safe H.264 using ffmpeg."""
-    import subprocess
-    import imageio_ffmpeg
+# ── H.264 transcoding ──────────────────────────────────────────────────────
 
+
+def _transcode_to_h264(input_path: str) -> str:
+    """Transcode to web-safe H.264. OpenCV writes mp4v, which browsers reject."""
     output_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-
     try:
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run(
+        import imageio_ffmpeg  # inside the try: a missing ffmpeg is a fallback,
+        # not a crash, and that is exactly what the except below is for
+
+        completed = subprocess.run(
             [
-                ffmpeg,
+                imageio_ffmpeg.get_ffmpeg_exe(),
                 "-y",
-                "-i",
-                input_path,
-                "-vcodec",
-                "libx264",
-                "-crf",
-                "28",
-                "-preset",
-                "fast",
-                "-pix_fmt",
-                "yuv420p",
+                "-i", input_path,
+                "-vcodec", "libx264",
+                "-crf", "28",
+                "-preset", "fast",
+                "-pix_fmt", "yuv420p",
+                # Put the index at the front so the browser can start playing
+                # before the whole file has downloaded.
+                "-movflags", "+faststart",
                 output_path,
             ],
             check=True,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        del completed
         os.remove(input_path)
         return output_path
-    except Exception as e:
-        print(f"FFmpeg transcode failed: {e}")
+    except (subprocess.CalledProcessError, OSError, ImportError) as exc:
+        # Returning the mp4v file is better than returning nothing, but it will
+        # very likely not play in a browser — so say why, loudly, rather than
+        # letting it look like a mysteriously blank video player.
+        detail = ""
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            detail = exc.stderr.decode("utf-8", "replace").strip().splitlines()[-1:]
+            detail = f" — {detail[0]}" if detail else ""
+        print(
+            f"ffmpeg transcode failed{detail}. Returning the raw mp4v file, "
+            "which most browsers cannot play."
+        )
+        if os.path.exists(output_path):
+            os.remove(output_path)
         return input_path
