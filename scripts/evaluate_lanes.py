@@ -323,6 +323,15 @@ def main(argv=None) -> int:
     ap.add_argument("--set", dest="overrides", action="append", default=[],
                     metavar="FIELD=VALUE", help="override a LaneConfig field")
     ap.add_argument("--json", action="store_true", help="emit JSON only")
+    ap.add_argument(
+        "--min-pass",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="exit non-zero if the pass rate falls below this. Frames are "
+        "generated from a fixed seed, so a given command scores identically "
+        "every run and this is a regression gate, not a flaky threshold.",
+    )
     args = ap.parse_args(argv)
 
     cfg = _apply_overrides(LaneConfig(), args.overrides)
@@ -348,6 +357,21 @@ def main(argv=None) -> int:
             if isinstance(value, float):
                 value = f"{value:.1f}"
             print(f"  {key:<{width}}  {value}")
+
+    if args.min_pass is not None:
+        actual = result.get("pass_pct")
+        if actual is None:
+            print(f"\n--min-pass does not apply to the {args.suite} suite.",
+                  file=sys.stderr)
+            return 2
+        if actual < args.min_pass:
+            print(
+                f"\nFAIL: pass rate {actual:.1f}% is below the {args.min_pass:.1f}% "
+                "floor. Lane accuracy has regressed.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"\nOK: pass rate {actual:.1f}% clears the {args.min_pass:.1f}% floor.")
     return 0
 
 

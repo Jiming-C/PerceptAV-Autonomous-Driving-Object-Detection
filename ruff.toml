@@ -1,0 +1,10 @@
+# Shared by CI and local runs, so `ruff check` means the same thing in both.
+line-length = 100
+
+[lint]
+select = [
+    "E",  # pycodestyle errors
+    "F",  # pyflakes
+    "W",  # pycodestyle warnings
+    "I",  # import sorting
+]

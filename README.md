@@ -2,6 +2,8 @@
 
 # 🚘 Autonomous Driving Object Detection
 
+[![CI](https://github.com/Jiming-C/PerceptAV-Autonomous-Driving-Object-Detection/actions/workflows/ci.yml/badge.svg)](https://github.com/Jiming-C/PerceptAV-Autonomous-Driving-Object-Detection/actions/workflows/ci.yml)
+
 A dashcam perception pipeline combining YOLOv8 object detection and classical computer vision for real-time vehicle, pedestrian, and lane identification. Built as a clean implementation of core AV perception techniques — hood masking, Hough transform lane detection, multi-object tracking, and inference optimization via frame skipping.
 <img width="1494" height="429" alt="image" src="https://github.com/user-attachments/assets/06980589-f072-47e7-b3c5-d497c5379ae9" />
 
@@ -112,6 +114,12 @@ Almost all of it came from **one algorithmic change, not from parameter tuning**
 
 Reproduce with `python scripts/evaluate_lanes.py --frames 300 --set ego_select_innermost=False`.
 
+Because frames come from a fixed seed, a given command scores identically on every run and every machine, which makes the benchmark usable as a gate rather than a report. CI runs it with a floor:
+
+```bash
+python scripts/evaluate_lanes.py --frames 300 --min-pass 90    # exits non-zero below 90%
+```
+
 Parameter sweeps, by contrast, found nothing worth changing — every alternative that looked better on 120 frames either fell within noise or collapsed on harder scenes at 300. **The Canny, Hough and slope thresholds are unchanged from the original hand-tuned values.** That is a result too, and the harness is what turned "these look fine" into something checkable.
 
 Temporal smoothing, measured on a static scene where any output movement is the detector being unsteady (`--suite temporal`):
@@ -135,6 +143,7 @@ python scripts/evaluate_lanes.py --suite tusimple --data-root data/TUSimple/trai
 
 ```
 PerceptAV-Autonomous-Driving-Object-Detection/
+├── .github/workflows/ci.yml    # lint, tests and the lane benchmark gate
 ├── app.py                      # Gradio web interface
 ├── detection/
 │   ├── __init__.py
@@ -148,7 +157,9 @@ PerceptAV-Autonomous-Driving-Object-Detection/
 ├── tests/                      # pytest suite
 ├── examples/
 │   └── demo.MP4                # pre-loaded dashcam demo video
-├── requirements.txt
+├── requirements.txt            # runtime dependencies
+├── requirements-test.txt       # test suite only — no torch, no gradio
+├── ruff.toml
 ├── yolov8n.pt                  # YOLOv8 Nano weights (auto-downloaded)
 └── README.md
 ```
@@ -197,11 +208,24 @@ print(summary.to_markdown())
 
 ### Tests
 
+The suite and the benchmark need only NumPy and OpenCV — no torch, no gradio — so they run in a couple of seconds:
+
 ```bash
-pip install pytest
-pytest                                                  # skips the model-dependent tests
-PERCEPTAV_TEST_MODEL=yolov8n.pt pytest                  # runs everything
+pip install -r requirements-test.txt
+pytest                                    # the four model-dependent tests skip themselves
+ruff check .
+python scripts/evaluate_lanes.py --frames 300 --min-pass 90
 ```
+
+To include the end-to-end tests that actually run YOLO, point them at a weights file:
+
+```bash
+PERCEPTAV_TEST_MODEL=yolov8n.pt pytest
+```
+
+### CI
+
+`.github/workflows/ci.yml` runs lint, the test suite and both benchmark gates on Python 3.10, 3.11 and 3.12 for every pull request. A separate job installs the full stack with CPU-only torch and runs the end-to-end tests against real weights; it is limited to `main` and manual dispatch, since installing torch is the slow part.
 
 ---
 
